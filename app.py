@@ -186,48 +186,60 @@ class CardDetector:
             raise CardDetectionError(f"Card detection process failed due to an unexpected error: {e}")
 
     def _assign_card_positions(self, card_predictions: list, image_dimensions: dict) -> list:
-        """Assigns position numbers to detected cards based on their location."""
+        """
+        Assigns position numbers to detected cards based on their location,
+        with fewer assumptions about card layout.
+        """
         cards = [{
-            "x": pred["x"], "y": pred["y"], "width": pred["width"], "height": pred["height"], "detection_id": pred["detection_id"]
+            "x": pred["x"], "y": pred["y"], 
+            "width": pred["width"], "height": pred["height"],
+            "detection_id": pred["detection_id"]
         } for pred in card_predictions]
-
-        # Adjust number of rows based on total cards - more flexible algorithm
-        total_cards = len(cards)
         
-        # Estimate number of rows based on typical SET layouts
-        if total_cards <= 4:
-            n_rows = 1
-        elif total_cards <= 9:
-            n_rows = 3
-        elif total_cards <= 16:
-            n_rows = 4
-        else:
-            n_rows = 5
-            
-        row_height = image_dimensions["height"] / n_rows
-        rows = defaultdict(list)
-
-        for card in cards:
-            row_index = int(card["y"] / row_height)
-            rows[row_index].append(card)
-
-        for row_index in rows:
-            rows[row_index].sort(key=lambda c: c["x"])
-
+        # Calculate average card height to use as a threshold for vertical grouping
+        avg_card_height = sum(card["height"] for card in cards) / len(cards)
+        vertical_threshold = avg_card_height * 0.5
+        
+        # Group cards by approximate rows (cards with similar y-coordinates)
+        rows = []
+        cards_sorted_by_y = sorted(cards, key=lambda c: c["y"])
+        
+        current_row = [cards_sorted_by_y[0]]
+        for card in cards_sorted_by_y[1:]:
+            # If this card is close enough vertically to the first card in current row, add it
+            if abs(card["y"] - current_row[0]["y"]) <= vertical_threshold:
+                current_row.append(card)
+            else:
+                # Otherwise, start a new row
+                rows.append(current_row)
+                current_row = [card]
+        
+        # Add the last row if not empty
+        if current_row:
+            rows.append(current_row)
+        
+        # Sort each row by x-coordinate
+        for row in rows:
+            row.sort(key=lambda c: c["x"])
+        
+        # Assign sequential positions
         cards_with_positions = []
         position = 1
-        for row_index in sorted(rows.keys()):
-            for card in rows[row_index]:
+        for row in rows:
+            for card in row:
                 cards_with_positions.append({
                     "position": position,
                     "box": {
-                        "x1": int(card["x"] - card["width"] / 2), "y1": int(card["y"] - card["height"] / 2),
-                        "x2": int(card["x"] + card["width"] / 2), "y2": int(card["y"] + card["height"] / 2)
+                        "x1": int(card["x"] - card["width"] / 2), 
+                        "y1": int(card["y"] - card["height"] / 2),
+                        "x2": int(card["x"] + card["width"] / 2), 
+                        "y2": int(card["y"] + card["height"] / 2)
                     },
                     "center": {"x": int(card["x"]), "y": int(card["y"])},
                     "detection_id": card["detection_id"]
                 })
                 position += 1
+        
         return cards_with_positions
 
 
@@ -244,26 +256,55 @@ class CardClassifier:
             raise ValueError("Claude API key is required for card classification. Please set CLAUDE_API_KEY in environment variables.")
         return self._classify_cards_with_claude(image, cards_with_positions)
 
+    def _prepare_labeled_image_for_claude(self, image: np.ndarray, cards_with_positions: list) -> np.ndarray:
+        """Creates a labeled version of the image with position numbers for Claude."""
+        labeled_image = image.copy()
+        for card in cards_with_positions:
+            position = card["position"]
+            center_x, center_y = card["center"]["x"], card["center"]["y"]
+            
+            # Draw a circle with a position number for clear identification
+            cv2.circle(labeled_image, (center_x, center_y), 20, (0, 0, 0), -1)
+            cv2.putText(labeled_image, str(position), (center_x - 7, center_y + 7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        
+        return labeled_image
+
     def _classify_cards_with_claude(self, image: np.ndarray, cards_with_positions: list) -> dict:
-        """Classifies cards using Claude API."""
+        """Classifies cards using Claude API with improved position labeling."""
         try:
-            img_base64 = self.image_processor.encode_image_to_base64(image)
+            # Create labeled image with position numbers for Claude
+            labeled_image = self._prepare_labeled_image_for_claude(image, cards_with_positions)
+            img_base64 = self.image_processor.encode_image_to_base64(labeled_image)
+            
             headers = {
                 "x-api-key": self.config.CLAUDE_API_KEY,
                 "content-type": "application/json",
                 "anthropic-version": "2023-06-01"
             }
             
-            # Update prompt to handle any number of cards
-            total_cards = len(cards_with_positions)
+            # Create detailed position information for the prompt
+            position_details = []
+            for card in cards_with_positions:
+                pos = card["position"]
+                center = card["center"]
+                position_details.append(f"Card {pos}: at coordinates ({center['x']}, {center['y']})")
+            
+            position_info = "\n".join(position_details)
+            
+            # Enhanced prompt with explicit position information
             prompt = (
-                f"Analyze the SET card game image. There are {total_cards} cards visible in a grid layout. "
-                f"Cards are numbered from top-left to bottom-right, in rows. "
-                f"For each card, identify: 1. Number (1, 2, or 3 shapes), 2. Color (Red, Green, or Purple), "
-                f"3. Shape (Oval, Diamond, or Squiggle), 4. Shading (Solid, Striped, or Outline). "
-                f"Return a JSON object with card positions as keys: "
-                f"{{'1': {{'number': '1|2|3', 'color': 'red|green|purple', 'shape': 'oval|diamond|squiggle', 'shading': 'solid|striped|outline'}}, ...}} "
-                f"Return only JSON, no explanations."
+                f"Analyze the SET card game image. Each card has a NUMBER label on it (white numbers in black circles).\n"
+                f"There are {len(cards_with_positions)} cards visible with the following positions:\n"
+                f"{position_info}\n\n"
+                f"For each numbered card, identify these 4 features:\n"
+                f"1. Number (1, 2, or 3 shapes)\n"
+                f"2. Color (Red, Green, or Purple)\n"
+                f"3. Shape (Oval, Diamond, or Squiggle)\n"
+                f"4. Shading (Solid, Striped, or Outline)\n\n"
+                f"Return a JSON object with card positions as keys:\n"
+                f"{{'1': {{'number': '1|2|3', 'color': 'red|green|purple', 'shape': 'oval|diamond|squiggle', 'shading': 'solid|striped|outline'}}, ...}}\n"
+                f"Return only JSON, no explanations. Make sure to use the white numbers in black circles as position references."
             )
             
             data = {
@@ -355,8 +396,20 @@ class Visualizer:
         self.image_processor = image_processor
 
     def draw_sets_on_image(self, image: np.ndarray, sets_found: list[list[int]], cards_with_positions: list) -> np.ndarray:
-        """Draws bounding boxes and labels for detected sets on the image."""
+        """Draws bounding boxes, labels, and position numbers for detected sets on the image."""
         annotated_image = image.copy()
+        
+        # First, draw position numbers on all cards for clarity and reference
+        for card in cards_with_positions:
+            position = card["position"]
+            center_x, center_y = card["center"]["x"], card["center"]["y"]
+            
+            # Draw a circle with the position number
+            cv2.circle(annotated_image, (center_x, center_y), 15, (255, 255, 255), -1)
+            cv2.circle(annotated_image, (center_x, center_y), 15, (0, 0, 0), 1)
+            cv2.putText(annotated_image, str(position), (center_x - 5, center_y + 5),
+                      self.config.FONT, 0.5, (0, 0, 0), 1, lineType=cv2.LINE_AA)
+        
         if not sets_found:
             logging.info("No sets found to draw.")
             return annotated_image
@@ -382,8 +435,9 @@ class Visualizer:
                 cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, self.config.BOX_THICKNESS)
                 if pos == sets_found[set_idx][0]:  # Label only once per set
                     cv2.putText(annotated_image, f"Set {set_idx + 1}", (x1, y1 - 10),
-                                self.config.FONT, self.config.FONT_SCALE, color, self.config.BOX_THICKNESS, lineType=cv2.LINE_AA)
-        logging.info("Sets drawn on image.")
+                              self.config.FONT, self.config.FONT_SCALE, color, self.config.BOX_THICKNESS, lineType=cv2.LINE_AA)
+        
+        logging.info("Sets and position numbers drawn on image.")
         return annotated_image
 
 
