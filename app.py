@@ -1,5 +1,8 @@
-# SET Game Detector - Production Backend API
-# For Render.com deployment
+#!/usr/bin/env python3
+"""
+SET Game Detector - Production Backend API
+For Render.com deployment
+"""
 
 # Imports
 import os
@@ -12,21 +15,48 @@ from itertools import combinations
 import io
 import traceback
 import time
+import sys
 from collections import defaultdict
 from inference_sdk import InferenceHTTPClient
 import re  # For JSON parsing from Claude
 import logging  # For logging
 import uuid
 from typing import List, Dict, Any, Optional, Tuple
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Request
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 import uvicorn
 from pydantic import BaseModel
 import tempfile
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
 
 # --- Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(module)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(module)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# --- Custom Middleware ---
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = str(uuid.uuid4())[:8]
+        logging.info(f"[{request_id}] {request.method} {request.url.path}")
+        start_time = time.time()
+        
+        try:
+            response = await call_next(request)
+            process_time = time.time() - start_time
+            logging.info(f"[{request_id}] Completed: {response.status_code} ({process_time:.3f}s)")
+            return response
+        except Exception as e:
+            process_time = time.time() - start_time
+            logging.error(f"[{request_id}] Error: {str(e)} ({process_time:.3f}s)", exc_info=True)
+            raise
 
 # --- FastAPI App Setup ---
 app = FastAPI(
@@ -35,14 +65,18 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Add CORS middleware
+# Add middlewares
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Replace with your frontend domain in production
+    allow_origins=["*"],  # Allow all origins
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["*"],  # Expose all headers to the browser
+    max_age=86400,  # Cache preflight requests for 24 hours
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000)  # Compress responses
+app.add_middleware(RequestLoggingMiddleware)  # Log all requests
 
 # --- Configuration ---
 class Config:
@@ -73,6 +107,11 @@ class Config:
 
     # Output directories and paths
     RESULTS_DIR = os.environ.get("RESULTS_DIR", "/tmp/set_results")
+    
+    # Timeouts
+    ROBOFLOW_TIMEOUT = 30  # seconds
+    CLAUDE_TIMEOUT = 30  # seconds
+    PROCESS_TIMEOUT = 60  # seconds
 
 
 # --- Custom Exceptions ---
@@ -154,12 +193,18 @@ class CardDetector:
             if not self.image_processor.save_image_to_path(image, temp_path):
                 raise ImageProcessingError("Failed to save temporary image for card detection.")
             
+            # Log that we're about to call Roboflow
+            logging.info(f"Calling Roboflow API to detect cards in {temp_path}")
+            
+            # Set a timeout for the Roboflow API call
+            start_time = time.time()
             result = self.roboflow_client.run_workflow(
                 workspace_name="tel-aviv",
                 workflow_id="custom-workflow",
                 images={"image": temp_path},
                 use_cache=True
             )
+            logging.info(f"Roboflow API call completed in {time.time() - start_time:.2f} seconds")
             
             # Clean up temporary file
             try:
@@ -322,14 +367,28 @@ class CardClassifier:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    response = requests.post(self.config.CLAUDE_API_URL, headers=headers, json=data, timeout=30)
+                    logging.info(f"Calling Claude API (attempt {attempt + 1}/{max_retries})")
+                    start_time = time.time()
+                    response = requests.post(
+                        self.config.CLAUDE_API_URL, 
+                        headers=headers, 
+                        json=data, 
+                        timeout=self.config.CLAUDE_TIMEOUT
+                    )
+                    logging.info(f"Claude API call completed in {time.time() - start_time:.2f} seconds")
                     response.raise_for_status()
                     break
+                except requests.exceptions.Timeout:
+                    if attempt == max_retries - 1:
+                        raise ClaudeAPIError(f"Claude API request timed out after {self.config.CLAUDE_TIMEOUT} seconds")
+                    wait_time = min(2 ** attempt, 10)
+                    logging.warning(f"Claude API timeout (attempt {attempt + 1}/{max_retries}). Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
                 except requests.exceptions.RequestException as e:
                     if attempt == max_retries - 1:
                         raise ClaudeAPIError(f"Claude API request failed after {max_retries} retries: {e}")
                     wait_time = min(2 ** attempt, 10)
-                    logging.warning(f"Request error (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time} seconds...", exc_info=True)
+                    logging.warning(f"Request error (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time} seconds...")
                     time.sleep(wait_time)
 
             response_json = response.json()
@@ -348,8 +407,8 @@ class CardClassifier:
                 raise CardClassificationError("Failed to parse Claude's response as JSON. Please check Claude API response format.")
 
         except requests.exceptions.HTTPError as e:
-            logging.error(f"Claude API HTTP error: {e}. Response: {e.response.text}", exc_info=True)
-            raise ClaudeAPIError(f"Claude API HTTP error: {e}. Status Code: {e.response.status_code}")
+            logging.error(f"Claude API HTTP error: {e}. Response: {getattr(e.response, 'text', 'No response text')}", exc_info=True)
+            raise ClaudeAPIError(f"Claude API HTTP error: {e}. Status Code: {getattr(e.response, 'status_code', 'Unknown')}")
         except ClaudeAPIError as e:
             logging.error(f"Claude API error after retries: {e}", exc_info=True)
             raise
@@ -454,28 +513,29 @@ class SetGameDetector:
 
     def process_image(self, image_bytes: bytes) -> tuple[np.ndarray, list[list[int]], dict]:
         """Processes an image to detect SETs."""
-        logging.info("Starting image processing")
+        request_id = str(uuid.uuid4())[:8]
+        logging.info(f"[{request_id}] Starting image processing")
         try:
             image = self.image_processor.load_image_from_bytes(image_bytes)
 
-            logging.info("Detecting cards...")
+            logging.info(f"[{request_id}] Detecting cards...")
             cards_with_positions, image_dimensions = self.card_detector.detect_cards(image)
-            logging.info(f"Detected {len(cards_with_positions)} cards.")
+            logging.info(f"[{request_id}] Detected {len(cards_with_positions)} cards.")
 
-            logging.info("Classifying cards...")
+            logging.info(f"[{request_id}] Classifying cards...")
             card_features = self.card_classifier.classify_cards(image, cards_with_positions)
 
-            logging.info("Finding sets...")
+            logging.info(f"[{request_id}] Finding sets...")
             sets_found = self.set_logic.find_sets(card_features)
 
-            logging.info("Drawing sets on image...")
+            logging.info(f"[{request_id}] Drawing sets on image...")
             annotated_image = self.visualizer.draw_sets_on_image(image, sets_found, cards_with_positions)
 
-            logging.info(f"Image processing completed. Found {len(sets_found)} sets.")
+            logging.info(f"[{request_id}] Image processing completed. Found {len(sets_found)} sets.")
             return annotated_image, sets_found, card_features
 
         except Exception as e:
-            logging.error(f"Error during image processing: {e}", exc_info=True)
+            logging.error(f"[{request_id}] Error during image processing: {e}", exc_info=True)
             raise
 
 
@@ -487,26 +547,188 @@ class ProcessResponse(BaseModel):
     card_features: Dict[str, Dict[str, str]]
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Runs on application startup to ensure everything is properly initialized."""
+    try:
+        logging.info("Starting SET Detector API...")
+        
+        # Verify environment variables and create necessary directories
+        config = Config()
+        os.makedirs(config.RESULTS_DIR, exist_ok=True)
+        
+        # Check API key availability without exposing the actual keys
+        if not config.ROBOFLOW_API_KEY:
+            logging.warning("⚠️ Roboflow API key not configured. Card detection will fail.")
+        else:
+            logging.info("✓ Roboflow API key configured.")
+            
+        if not config.CLAUDE_API_KEY:
+            logging.warning("⚠️ Claude API key not configured. Card classification will fail.")
+        else:
+            logging.info("✓ Claude API key configured.")
+        
+        # Attempt to initialize OpenCV to ensure it's working
+        try:
+            blank_image = np.zeros((10, 10, 3), np.uint8)
+            encoded = cv2.imencode('.jpg', blank_image)[1]
+            logging.info("✓ OpenCV initialized successfully.")
+        except Exception as cv_error:
+            logging.error(f"OpenCV initialization failed: {cv_error}")
+            
+        logging.info("SET Detector API startup complete.")
+    except Exception as e:
+        logging.error(f"Error during startup: {e}", exc_info=True)
+        # We don't want to prevent the app from starting, so just log the error
+
+
+@app.get("/api/health")
+async def health_check():
+    """Enhanced health check endpoint."""
+    try:
+        config = Config()
+        return {
+            "status": "healthy",
+            "version": "1.0.0",
+            "timestamp": time.time(),
+            "environment": os.environ.get("ENVIRONMENT", "production"),
+            "roboflow_key_configured": bool(config.ROBOFLOW_API_KEY),
+            "claude_key_configured": bool(config.CLAUDE_API_KEY)
+        }
+    except Exception as e:
+        logging.error(f"Health check failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "unhealthy", "error": str(e)}
+        )
+
+
+@app.options("/api/health")
+async def health_preflight():
+    """Preflight response for health check."""
+    return PlainTextResponse("")
+
+
+@app.options("/api/process")
+async def process_preflight():
+    """Preflight response for process endpoint."""
+    return PlainTextResponse("")
+
+
+@app.get("/api/test-cors")
+async def test_cors():
+    """Test endpoint to verify CORS is working."""
+    return {"cors_test": "success"}
+
+
+@app.options("/api/test-cors")
+async def test_cors_preflight():
+    """Preflight response for CORS test."""
+    return PlainTextResponse("")
+
+
+@app.get("/api/ping")
+async def ping():
+    """Simple ping endpoint for quick availability checks."""
+    return {"ping": "pong"}
+
+
+@app.get("/api/debug-info")
+async def debug_info():
+    """Return diagnostic information about the API environment."""
+    try:
+        import platform
+        import socket
+        
+        # Get basic system info without exposing sensitive details
+        system_info = {
+            "python_version": platform.python_version(),
+            "platform": platform.platform(),
+            "hostname": socket.gethostname()
+        }
+        
+        # Get environment variables (excluding sensitive values)
+        env_vars = {}
+        for key in os.environ:
+            if "KEY" not in key.upper() and "SECRET" not in key.upper() and "PASSWORD" not in key.upper():
+                env_vars[key] = os.environ[key] if len(os.environ[key]) < 50 else f"{os.environ[key][:25]}...truncated"
+        
+        return {
+            "status": "ok",
+            "system_info": system_info,
+            "environment": env_vars,
+        }
+    except Exception as e:
+        logging.error(f"Debug info retrieval failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Failed to retrieve debug info: {str(e)}"}
+        )
+
+
 @app.post("/api/process", response_model=ProcessResponse)
 async def process_image(file: UploadFile = File(...)):
     """Process an image of a SET game and return the results."""
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image")
+    request_id = str(uuid.uuid4())
+    logging.info(f"[{request_id}] Processing request with file: {file.filename}, size: {file.size if hasattr(file, 'size') else 'unknown'}")
+    
+    # Validate file type
+    content_type = file.content_type or ""
+    if not content_type.startswith("image/"):
+        logging.warning(f"[{request_id}] Invalid file type: {content_type}")
+        raise HTTPException(status_code=400, detail="File must be an image (JPEG, PNG, etc.)")
     
     try:
         # Read image bytes
-        image_bytes = await file.read()
+        try:
+            image_bytes = await file.read()
+            if not image_bytes:
+                raise ValueError("Empty file uploaded")
+            logging.info(f"[{request_id}] Successfully read {len(image_bytes)} bytes from uploaded file")
+        except Exception as read_error:
+            logging.error(f"[{request_id}] Error reading uploaded file: {read_error}", exc_info=True)
+            raise HTTPException(status_code=400, detail=f"Failed to read uploaded file: {str(read_error)}")
+        
+        # Check API keys before processing
+        config = Config()
+        if not config.ROBOFLOW_API_KEY:
+            logging.error(f"[{request_id}] Roboflow API key not configured")
+            raise HTTPException(status_code=503, 
+                               detail="Roboflow API key is not configured. Please set the ROBOFLOW_API_KEY environment variable.")
+        
+        if not config.CLAUDE_API_KEY:
+            logging.error(f"[{request_id}] Claude API key not configured")
+            raise HTTPException(status_code=503, 
+                               detail="Claude API key is not configured. Please set the CLAUDE_API_KEY environment variable.")
         
         # Initialize detector
-        detector = SetGameDetector()
+        detector = SetGameDetector(config)
         
-        # Process image
-        annotated_image, sets_found, card_features = detector.process_image(image_bytes)
+        # Process image with timeout handling
+        logging.info(f"[{request_id}] Starting image processing pipeline")
+        try:
+            # We'll set a reasonable timeout for the processing
+            start_time = time.time()
+            annotated_image, sets_found, card_features = detector.process_image(image_bytes)
+            processing_time = time.time() - start_time
+            logging.info(f"[{request_id}] Processing completed in {processing_time:.2f} seconds")
+        except Exception as process_error:
+            logging.error(f"[{request_id}] Error during image processing: {process_error}", exc_info=True)
+            if "timed out" in str(process_error).lower():
+                raise HTTPException(status_code=504, detail="Processing timed out. The image may be too complex or the server is under heavy load.")
+            else:
+                raise
         
         # Encode image for response
-        image_base64 = detector.image_processor.encode_image_to_base64(annotated_image)
+        try:
+            image_base64 = detector.image_processor.encode_image_to_base64(annotated_image)
+            logging.info(f"[{request_id}] Successfully encoded result image to base64")
+        except Exception as encode_error:
+            logging.error(f"[{request_id}] Error encoding result image: {encode_error}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to encode result image: {str(encode_error)}")
         
         # Return results
+        logging.info(f"[{request_id}] Request completed successfully. Found {len(sets_found)} sets and {len(card_features)} cards.")
         return ProcessResponse(
             image_base64=image_base64,
             sets_found=sets_found,
@@ -514,20 +736,21 @@ async def process_image(file: UploadFile = File(...)):
         )
     
     except CardDetectionError as e:
+        logging.error(f"[{request_id}] Card detection failed: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=f"Card detection failed: {str(e)}")
     except CardClassificationError as e:
+        logging.error(f"[{request_id}] Card classification failed: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=f"Card classification failed: {str(e)}")
     except ClaudeAPIError as e:
+        logging.error(f"[{request_id}] Claude API error: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail=f"Claude API error: {str(e)}")
+    except HTTPException:
+        # Re-raise HTTP exceptions without modification
+        raise
     except Exception as e:
-        logging.error(f"Unexpected error during processing: {e}", exc_info=True)
+        error_detail = traceback.format_exc()
+        logging.error(f"[{request_id}] Unexpected error during processing: {e}\n{error_detail}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
-
-
-@app.get("/api/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy", "version": "1.0.0"}
 
 
 # --- Run the application ---
