@@ -14,7 +14,7 @@ import io
 import traceback
 import time
 from collections import defaultdict
-from inference_sdk import InferenceHTTPClient
+from roboflow import InferenceHTTPClient
 import re  # For JSON parsing from Claude
 import logging # For logging
 
