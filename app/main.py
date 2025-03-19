@@ -31,7 +31,7 @@ app = FastAPI(
 )
 
 # Define CORS settings
-origins = ["*"]  # Allow requests from any origin
+#origins = ["*"]  # Allow requests from any origin
 
 app.add_middleware(
     CORSMiddleware,
