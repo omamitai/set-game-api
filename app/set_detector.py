@@ -18,7 +18,7 @@ import uuid
 import logging
 from collections import defaultdict
 from typing import List, Dict, Any, Optional, Tuple
-from roboflow import Roboflow
+from inference_sdk import InferenceHTTPClient
 
 from app.config import get_settings
 
@@ -140,9 +140,10 @@ class CardDetector:
         if not self.config.ROBOFLOW_API_KEY:
             logging.warning("Roboflow API key not set!")
         
-        # Initialize Roboflow SDK
-        self.rf = Roboflow(api_key=self.config.ROBOFLOW_API_KEY)
-        self.project = self.rf.workspace("tel-aviv").project("custom-workflow")
+        self.roboflow_client = InferenceHTTPClient(
+            api_url=self.config.ROBOFLOW_API_URL,
+            api_key=self.config.ROBOFLOW_API_KEY
+        )
 
     def detect_cards(self, image: np.ndarray) -> tuple[list, dict]:
         """
@@ -164,14 +165,14 @@ class CardDetector:
             temp_filename = f"{uuid.uuid4()}.jpg"
             cv2.imwrite(temp_filename, image)
 
-            # Get image dimensions
-            height, width = image.shape[:2]
-            image_dimensions = {"width": width, "height": height}
-
             # Call Roboflow API
-            model = self.project.version("1").model
-            result = model.predict(temp_filename, confidence=40, overlap=30)
-            
+            result = self.roboflow_client.run_workflow(
+                workspace_name="tel-aviv",
+                workflow_id="custom-workflow",
+                images={"image": temp_filename},
+                use_cache=True
+            )
+
             # Clean up temporary file
             try:
                 os.remove(temp_filename)
@@ -179,8 +180,9 @@ class CardDetector:
                 logging.warning(f"Failed to remove temporary file {temp_filename}: {e}")
 
             # Process predictions
-            predictions = result.json()
-            card_predictions = [pred for pred in predictions['predictions'] if pred["class"] == "card"]
+            predictions = result[0]["predictions"]["predictions"]
+            image_dimensions = result[0]["predictions"]["image"]
+            card_predictions = [pred for pred in predictions if pred["class"] == "card"]
 
             if not card_predictions:
                 raise CardDetectionError("No cards detected in the image by Roboflow.")
