@@ -1,0 +1,58 @@
+# Version control
+.git
+.gitignore
+.github
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+.venv/
+.pytest_cache/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Temp files
+*.log
+*.tmp
+.DS_Store
+
+# Documentation
+docs/
+README.md
+CHANGELOG.md
+LICENSE
+
+# Images and data files
+*.jpg
+*.png
+*.gif
+*.csv
+*.json
