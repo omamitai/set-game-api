@@ -33,13 +33,14 @@ app = FastAPI(
 # Define CORS settings
 origins = ["*"]  # Allow requests from any origin
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,  # Changed to False since we're using wildcard origin
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],  # Add this line
+    max_age=86400,  # Cache preflight requests for 24 hours
 )
 # Include API routes
 app.include_router(api_router, prefix="/api")
