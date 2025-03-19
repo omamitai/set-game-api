@@ -6,6 +6,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
     libglib2.0-0 \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
@@ -22,5 +23,5 @@ RUN mkdir -p /tmp/set_results
 # Expose the port
 EXPOSE 8000
 
-# Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Use shell form to properly expand environment variables
+CMD sh -c "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
