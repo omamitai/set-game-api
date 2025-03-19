@@ -1,27 +1,33 @@
-FROM python:3.10-slim
+# Use official Python image as base
+FROM python:3.9-slim
 
+# Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies (OpenCV requirements)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
     libglib2.0-0 \
-    git \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
+# Copy requirements file
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY main.py .
-COPY set_detector.py .
+COPY . .
 
-# Create temporary directory for image processing
-RUN mkdir -p /tmp/set_results
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PORT=8000
 
 # Expose the port
-EXPOSE 8000
+EXPOSE ${PORT}
 
-# Use shell form to properly expand environment variables
-CMD sh -c "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
+# Run the application
+CMD ["python", "-m", "app.main"]
