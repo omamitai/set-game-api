@@ -53,10 +53,10 @@ class Config:
             (255, 0, 255), (0, 255, 255), (128, 0, 0), (0, 128, 0),
             (0, 0, 128), (128, 128, 0), (128, 0, 128), (0, 128, 128)
         ]
-        self.BOX_THICKNESS = 5
+        self.BOX_THICKNESS = 8
         self.FONT_SCALE = 0.9
         self.FONT = cv2.FONT_HERSHEY_SIMPLEX
-        self.OFFSET_STEP = 6
+        self.OFFSET_STEP = 10
 
 
 # --- Custom Exceptions ---
