@@ -12,3 +12,8 @@ restartPolicyMaxRetries = 10
 name = "set-game-api"
 internal_port = 8000
 healthcheck = { path = "/api/health", interval = "10s", timeout = "5s", retries = 5 }
+
+# Resource specifications
+[services.resources]
+cpu = "1x"
+memory = "1GB"
